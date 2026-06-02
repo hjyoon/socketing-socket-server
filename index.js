@@ -1,21 +1,16 @@
 import Fastify from "fastify";
-import { Server } from "socket.io";
-import { createAdapter } from "@socket.io/redis-adapter";
-import { instrument } from "@socket.io/admin-ui";
+import { WebSocket, WebSocketServer } from "ws";
 import jwt from "jsonwebtoken";
 import fastifyEnv from "@fastify/env";
 import cors from "@fastify/cors";
-import fastifyStatic from "@fastify/static";
 import fastifyRedis from "@fastify/redis";
 import fastifyPostgres from "@fastify/postgres";
 // import fastifyRabbit from "fastify-rabbitmq";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 import crypto from "node:crypto";
 
 const SELECTION_TIMEOUT = 10 * 1000; // 선택 만료 시간: 10초
-const RESERVATION_STATUS_INTERVAL = 1 * 1000; // 좌석 예매 현황 불러오는 주기: 1초
 const PAYMENT_TIMEOUT = 60 * 1000; // 결제 만료 시간: 1분 (테스트용)
+const RESERVATION_BROADCAST_CHANNEL = "socketing:reservation:broadcast";
 
 const schema = {
   type: "object",
@@ -60,9 +55,6 @@ const schema = {
 const createServiceUrl = (baseUrl, path) =>
   new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 const fastify = Fastify({
   logger: true,
 });
@@ -89,16 +81,6 @@ await fastify.register(fastifyPostgres, {
 // await fastify.register(fastifyRabbit, {
 //   connection: fastify.config.MQ_URL,
 // });
-
-await fastify.register(fastifyStatic, {
-  root: join(__dirname, "dist"),
-  prefix: "/admin",
-  redirect: true,
-});
-
-fastify.get("/reservation", async (request, reply) => {
-  return reply.sendFile("reservation.html");
-});
 
 fastify.get("/liveness", (request, reply) => {
   reply.send({ status: "ok", message: "The server is alive." });
@@ -475,15 +457,19 @@ const handleExpirationEvent = async (areaName, seatId) => {
 
       await updateSeatInRedis(areaName, seatId, seat);
 
-      io.to(areaName).emit("seatsSelected", [
-        {
-          seatId: seat.id,
-          selectedBy: null,
-          updatedAt: seat.updatedAt,
-          expirationTime: null,
-          reservedUserId: null,
-        },
-      ]);
+      await publishReservationMessage({
+        room: areaName,
+        type: "seatsSelected",
+        payload: [
+          {
+            seatId: seat.id,
+            selectedBy: null,
+            updatedAt: seat.updatedAt,
+            expirationTime: null,
+            reservedUserId: null,
+          },
+        ],
+      });
 
       fastify.log.info(
         `Selection for seat ${seatId} has expired (area: ${areaName}).`
@@ -495,27 +481,12 @@ const handleExpirationEvent = async (areaName, seatId) => {
   }
 };
 
-const pubClient = fastify.redis.duplicate();
-const subClient = fastify.redis.duplicate();
-
-const io = new Server(fastify.server, {
-  cors: {
-    origin: "*",
-    methods: "*",
-    credentials: true,
-  },
-  transports: ["websocket"],
-  adapter: createAdapter(pubClient, subClient),
-});
-
-instrument(io, {
-  auth: {
-    type: "basic",
-    username: "admin",
-    password: "$2a$10$QWUn5UhhE3eSAu2a95fVn.PRVaamlJlJBMeT7viIrvgvfCOeUIV2W",
-  },
-  mode: "development",
-});
+const CLOSE_POLICY_VIOLATION = 1008;
+const wsServer = new WebSocketServer({ server: fastify.server });
+const wsClients = new Map();
+const wsRooms = new Map();
+const reservationPubClient = fastify.redis.duplicate();
+const reservationSubClient = fastify.redis.duplicate();
 
 // Redis 기반 유저 수 가져오기 함수
 async function getRoomUserCount(roomName) {
@@ -523,7 +494,6 @@ async function getRoomUserCount(roomName) {
   let delay = null;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // const sockets = await io.in(roomName).fetchSockets(); // 모든 노드에서 룸에 속한 소켓 ID 가져오기
       const count = await fastify.redis.get(`room:${roomName}:count`);
       return parseInt(count || "0"); // 소켓 수 반환
     } catch (err) {
@@ -563,660 +533,790 @@ function decorrelatedJitter(baseDelay, maxDelay, previousDelay) {
   );
 }
 
-io.use(async (socket, next) => {
-  const token = socket.handshake.auth.token;
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
 
-  if (!token) {
-    return next(new Error("Authentication error"));
+function sendRaw(ws, type, payload) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type, payload }));
+}
+
+function sendMessage(client, type, payload) {
+  sendRaw(client.ws, type, payload);
+}
+
+function closeClient(client, code = 1000, reason = "") {
+  if (client.ws.readyState === WebSocket.OPEN) {
+    client.ws.close(code, reason);
+  }
+}
+
+function addClientToRoom(client, roomName) {
+  if (client.rooms.has(roomName)) {
+    return false;
   }
 
-  if (!(await validateToken(token))) {
-    return next(new Error("Authentication error 2"));
+  client.rooms.add(roomName);
+  if (!wsRooms.has(roomName)) {
+    wsRooms.set(roomName, new Set());
+  }
+  wsRooms.get(roomName).add(client.id);
+  return true;
+}
+
+function removeClientFromRoom(client, roomName) {
+  client.rooms.delete(roomName);
+  const room = wsRooms.get(roomName);
+  if (!room) return;
+
+  room.delete(client.id);
+  if (room.size === 0) {
+    wsRooms.delete(roomName);
+  }
+}
+
+function removeClientFromAllRooms(client) {
+  for (const roomName of [...client.rooms]) {
+    removeClientFromRoom(client, roomName);
+  }
+}
+
+function getLocalRoomClients(roomName) {
+  const room = wsRooms.get(roomName);
+  if (!room) return [];
+
+  return [...room]
+    .map((socketId) => wsClients.get(socketId))
+    .filter((client) => client?.ws.readyState === WebSocket.OPEN);
+}
+
+function broadcastToRoom(roomName, type, payload) {
+  for (const client of getLocalRoomClients(roomName)) {
+    sendMessage(client, type, payload);
+  }
+}
+
+function broadcastToAll(type, payload) {
+  for (const client of wsClients.values()) {
+    sendMessage(client, type, payload);
+  }
+}
+
+function isMainRoom(roomName) {
+  return roomName.split("_").length === 2;
+}
+
+function isAreaRoom(roomName) {
+  return roomName.split("_").length === 3;
+}
+
+async function publishReservationMessage(message) {
+  await reservationPubClient.publish(
+    RESERVATION_BROADCAST_CHANNEL,
+    JSON.stringify(message)
+  );
+}
+
+async function handleReservationBroadcast(rawMessage) {
+  let message;
+  try {
+    message = JSON.parse(rawMessage);
+  } catch (error) {
+    fastify.log.error(`Invalid reservation broadcast message: ${error.message}`);
+    return;
+  }
+
+  if (!message.room || !message.type) return;
+  broadcastToRoom(message.room, message.type, message.payload);
+}
+
+reservationSubClient.on("message", (channel, rawMessage) => {
+  if (channel !== RESERVATION_BROADCAST_CHANNEL) return;
+  void handleReservationBroadcast(rawMessage);
+});
+
+const serverTimeInterval = setInterval(() => {
+  broadcastToAll("serverTime", new Date().toISOString());
+}, 1000);
+
+await reservationSubClient.subscribe(RESERVATION_BROADCAST_CHANNEL);
+
+async function leaveMainRoom(client, roomName) {
+  if (!client.rooms.has(roomName)) return;
+
+  removeClientFromRoom(client, roomName);
+  const currentConnections = await decrementRoomCount(roomName);
+  fastify.log.info(
+    `Client ${client.id} left room: ${roomName}. Current connections: ${currentConnections}`
+  );
+}
+
+async function leaveAreaRoom(client, areaName) {
+  if (!client.rooms.has(areaName)) return;
+
+  removeClientFromRoom(client, areaName);
+  const allSeats = await getAllSeatsFromRedis(areaName);
+  await releaseSeats(client.id, allSeats, areaName);
+  fastify.log.info(`Client ${client.id} left area: ${areaName}.`);
+}
+
+async function handleJoinRoom(client, { eventId, eventDateId } = {}) {
+  if (!eventId || !eventDateId) {
+    sendMessage(client, "error", { message: "Invalid room parameters." });
+    return;
+  }
+
+  const roomName = `${eventId}_${eventDateId}`;
+
+  try {
+    const joined = addClientToRoom(client, roomName);
+    let currentConnections = Number(
+      (await fastify.redis.get(`room:${roomName}:count`)) || 0
+    );
+    if (joined) {
+      currentConnections = await fastify.redis.incr(`room:${roomName}:count`);
+    }
+
+    fastify.log.info(
+      `Client ${client.id} joined room: ${roomName}. Current connections: ${currentConnections}`
+    );
+
+    let areas = await getAllAreasFromRedis(roomName);
+    if (areas.length === 0) {
+      areas = await getAreasForRoom(eventId, eventDateId);
+      for (const area of areas) {
+        await updateAreaInRedis(roomName, area.id, area);
+      }
+    }
+
+    sendMessage(client, "roomJoined", {
+      message: `You have joined the room: ${roomName}`,
+      areas,
+    });
+
+    const jwtToken = jwt.sign(
+      {
+        jti: crypto.randomUUID(),
+        sub: "scheduling",
+        eventId,
+        eventDateId,
+      },
+      fastify.config.JWT_SECRET,
+      {
+        expiresIn: 600,
+      }
+    );
+
+    await fetch(
+      createServiceUrl(
+        fastify.config.SCHEDULING_SERVER_URL,
+        "scheduling/seat/reservation/statistic"
+      ),
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwtToken}`,
+        },
+      }
+    );
+  } catch (error) {
+    fastify.log.error(`Error fetching data for room ${roomName}:`, error);
+    sendMessage(client, "error", {
+      message: "Failed to fetch room data.",
+    });
+  }
+}
+
+async function handleJoinArea(client, { eventId, eventDateId, areaId } = {}) {
+  if (!eventId || !eventDateId || !areaId) {
+    sendMessage(client, "error", { message: "Invalid area parameters." });
+    return;
+  }
+
+  const areaName = `${eventId}_${eventDateId}_${areaId}`;
+
+  try {
+    addClientToRoom(client, areaName);
+    fastify.log.info(`Client ${client.id} joined area: ${areaName}.`);
+
+    let seats = await getAllSeatsFromRedis(areaName);
+    if (seats.length === 0) {
+      seats = await getSeatsForArea(eventDateId, areaId);
+      for (const seat of seats) {
+        await updateSeatInRedis(areaName, seat.id, seat);
+      }
+    }
+
+    sendMessage(client, "areaJoined", {
+      message: `You have joined the area: ${areaName}`,
+      seats,
+    });
+  } catch (error) {
+    fastify.log.error(`Error fetching data for area ${areaName}:`, error);
+    sendMessage(client, "error", {
+      message: "Failed to fetch area data.",
+    });
+  }
+}
+
+async function handleSelectSeats(
+  client,
+  { seatId, eventId, eventDateId, areaId, numberOfSeats = 1 } = {}
+) {
+  if (!seatId || !eventId || !eventDateId || !areaId) {
+    sendMessage(client, "error", { message: "Invalid selectSeats parameters." });
+    return;
+  }
+
+  const areaName = `${eventId}_${eventDateId}_${areaId}`;
+  const allSeats = await getAllSeatsFromRedis(areaName);
+
+  await releaseSeats(client.id, allSeats, areaName);
+
+  const selectedSeat = allSeats.find((s) => s.id === seatId);
+  if (!selectedSeat) {
+    sendMessage(client, "error", { message: "Invalid seat ID." });
+    return;
+  }
+
+  const seatsToSelect = [];
+
+  if (numberOfSeats === 1) {
+    if (selectedSeat.reservedUserId) {
+      sendMessage(client, "error", {
+        message: `Seat ${selectedSeat.id} is reserved and cannot be selected.`,
+      });
+      return;
+    }
+
+    const expired = await isSeatExpired(areaName, selectedSeat.id);
+    if (selectedSeat.selectedBy && !expired) {
+      sendMessage(client, "error", {
+        message: `Seat ${selectedSeat.id} is already selected by another user.`,
+      });
+      return;
+    }
+
+    seatsToSelect.push(selectedSeat);
+  } else {
+    const adjacentSeats = findAdjacentSeats(
+      allSeats,
+      selectedSeat,
+      numberOfSeats
+    );
+
+    if (adjacentSeats.length < numberOfSeats) {
+      sendMessage(client, "error", {
+        message: "Not enough adjacent seats available",
+      });
+      return;
+    }
+    seatsToSelect.push(...adjacentSeats);
+  }
+
+  const currentTime = new Date().toISOString();
+  const result = [];
+  for (const seat of seatsToSelect) {
+    seat.selectedBy = client.id;
+    seat.updatedAt = currentTime;
+    seat.expirationTime = new Date(Date.now() + SELECTION_TIMEOUT).toISOString();
+
+    await updateSeatInRedis(areaName, seat.id, seat);
+    await setSeatExpirationInRedis(areaName, seat.id);
+
+    result.push({
+      seatId: seat.id,
+      selectedBy: client.id,
+      updatedAt: currentTime,
+      expirationTime: seat.expirationTime,
+    });
+
+    fastify.log.info(`Seat ${seat.id} selected by ${client.id}`);
+  }
+
+  await publishReservationMessage({
+    room: areaName,
+    type: "seatsSelected",
+    payload: result,
+  });
+}
+
+async function handleReserveSeats(
+  client,
+  { seatIds, eventId, eventDateId, areaId, userId } = {}
+) {
+  const roomName = `${eventId}_${eventDateId}`;
+  const areaName = `${eventId}_${eventDateId}_${areaId}`;
+  const seatsToReserve = [];
+  const broadcastUpdates = [];
+  const seatIdsToReserve = [];
+
+  if (!eventId || !eventDateId || !areaId || !userId) {
+    sendMessage(client, "error", { message: "Invalid reserveSeats parameters." });
+    return;
   }
 
   try {
-    const decoded = jwt.verify(token, fastify.config.JWT_SECRET_FOR_ENTRANCE);
-    socket.data.user = decoded;
-    next();
-  } catch (err) {
-    return next(new Error("Authentication error"));
-  }
-});
-
-// const roomIntervals = {};
-io.on("connection", (socket) => {
-  fastify.log.info(`New client connected: ${socket.id}`);
-
-  // 클라이언트가 room 정보를 전달
-  socket.on("joinRoom", async ({ eventId, eventDateId }) => {
-    if (!eventId || !eventDateId) {
-      socket.emit("error", { message: "Invalid room parameters." });
+    if (!Array.isArray(seatIds) || seatIds.length === 0) {
+      sendMessage(client, "error", { message: "Invalid seat IDs." });
       return;
     }
 
-    // room 이름 생성 (eventId와 eventDateId 조합)
-    const roomName = `${eventId}_${eventDateId}`;
-
-    try {
-      // Room 접속자가 최대치를 초과하면 연결 거부
-      // if (currentConnections >= MAX_ROOM_CONNECTIONS) {
-      //   socket.emit("error", {
-      //     message: `Room ${roomName} is full. Maximum connections reached.`,
-      //   });
-      //   return;
-      // }
-
-      // 클라이언트를 해당 room에 추가
-      socket.join(roomName);
-      const currentConnections = await fastify.redis.incr(
-        `room:${roomName}:count`
-      );
-
-      fastify.log.info(
-        `Client ${socket.id} joined room: ${roomName}. Current connections: ${currentConnections + 1}`
-      );
-
-      // 구역 정보 가져오기
-      let areas = await getAllAreasFromRedis(roomName);
-      if (areas.length === 0) {
-        // Redis에 구역 정보가 없으면 DB에서 가져오기
-        areas = await getAreasForRoom(eventId, eventDateId); // DB에서 가져오기
-        // Redis에 구역 정보 저장
-        for (const area of areas) {
-          await updateAreaInRedis(roomName, area.id, area);
-        }
-        // await setAreaDataInRedis(roomName, areas);
-      }
-
-      // 클라이언트에게 데이터 전송
-      socket.emit("roomJoined", {
-        message: `You have joined the room: ${roomName}`,
-        areas,
-      });
-
-      // startReservationStatusInterval(eventId, eventDateId);
-
-      const jwtToken = jwt.sign(
-        {
-          jti: crypto.randomUUID(),
-          sub: "scheduling",
-          eventId,
-          eventDateId,
-        },
-        fastify.config.JWT_SECRET,
-        {
-          expiresIn: 600, // 10분
-        }
-      );
-
-      await fetch(
-        createServiceUrl(
-          fastify.config.SCHEDULING_SERVER_URL,
-          "scheduling/seat/reservation/statistic"
-        ),
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
-          },
-        }
-      );
-    } catch (error) {
-      fastify.log.error(`Error fetching data for room ${roomName}:`, error);
-      socket.emit("error", {
-        message: "Failed to fetch room data.",
-      });
-    }
-  });
-
-  socket.on("joinArea", async ({ eventId, eventDateId, areaId }) => {
-    if (!eventId || !eventDateId || !areaId) {
-      socket.emit("error", { message: "Invalid area parameters." });
-      return;
-    }
-
-    const areaName = `${eventId}_${eventDateId}_${areaId}`;
-
-    try {
-      // 클라이언트를 해당 area에 추가
-      socket.join(areaName);
-
-      fastify.log.info(`Client ${socket.id} joined area: ${areaName}.`);
-
-      // 좌석 정보 가져오기
-      let seats = await getAllSeatsFromRedis(areaName);
-      if (seats.length === 0) {
-        // Redis에 좌석 정보가 없으면 DB에서 가져오기
-        seats = await getSeatsForArea(eventDateId, areaId); // DB에서 가져오기
-        // Redis에 좌석 정보 저장
-        for (const seat of seats) {
-          await updateSeatInRedis(areaName, seat.id, seat);
-        }
-        // await setSeatDataInRedis(areaName, seats);
-      }
-
-      // 클라이언트에게 데이터 전송
-      socket.emit("areaJoined", {
-        message: `You have joined the area: ${areaName}`,
-        seats,
-      });
-    } catch (error) {
-      fastify.log.error(`Error fetching data for area ${areaName}:`, error);
-      socket.emit("error", {
-        message: "Failed to fetch area data.",
-      });
-    }
-  });
-
-  // 좌석 선택 처리 (단일 및 연석)
-  socket.on(
-    "selectSeats",
-    async ({ seatId, eventId, eventDateId, areaId, numberOfSeats = 1 }) => {
-      const areaName = `${eventId}_${eventDateId}_${areaId}`;
-
-      // Redis에서 모든 좌석 정보 조회
-      const allSeats = await getAllSeatsFromRedis(areaName);
-
-      // 이전에 선택한 좌석들을 찾고 취소
-      await releaseSeats(socket.id, allSeats, areaName);
-
-      // 선택하려는 좌석 찾기
-      const selectedSeat = allSeats.find((s) => s.id === seatId);
-      if (!selectedSeat) {
-        socket.emit("error", { message: "Invalid seat ID." });
+    for (const seatId of seatIds) {
+      let seat = await getSeatFromRedis(areaName, seatId);
+      if (!seat) {
+        fastify.log.warn(`Invalid seat ID: ${seatId}`);
+        sendMessage(client, "error", { message: `Invalid seat ID: ${seatId}.` });
         return;
       }
 
-      const seatsToSelect = [];
+      if (seat.reservedUserId) {
+        sendMessage(client, "error", {
+          message: `Seat ${seat.id} is reserved and cannot be selected.`,
+        });
+        return;
+      }
 
-      if (numberOfSeats === 1) {
-        // 단일 좌석 선택
-
-        // 이미 예매된 좌석인지 확인
-        if (selectedSeat.reservedUserId) {
-          socket.emit("error", {
-            message: `Seat ${selectedSeat.id} is reserved and cannot be selected.`,
-          });
-          return;
-        }
-
-        // 이미 다른 유저가 선택한 좌석인지 확인
-        const expired = await isSeatExpired(areaName, selectedSeat.id);
-        if (selectedSeat.selectedBy && !expired) {
-          socket.emit("error", {
-            message: `Seat ${selectedSeat.id} is already selected by another user.`,
-          });
-          return;
-        }
-
-        seatsToSelect.push(selectedSeat);
-      } else {
-        // 연석 선택
-        const adjacentSeats = findAdjacentSeats(
-          allSeats,
-          selectedSeat,
-          numberOfSeats
-        );
-
-        // 가능한 좌석이 요청한 좌석 수보다 적으면 리턴
-        if (adjacentSeats.length < numberOfSeats) {
-          socket.emit("error", {
-            message: "Not enough adjacent seats available",
-          });
-          return;
-        }
-        seatsToSelect.push(...adjacentSeats);
+      const expired = await isSeatExpired(areaName, seat.id);
+      if (seat.selectedBy !== null && seat.selectedBy !== client.id && !expired) {
+        sendMessage(client, "error", {
+          message: `Seat ${seat.id} is already selected by another user.`,
+        });
+        return;
       }
 
       const currentTime = new Date().toISOString();
-      const result = [];
-      for (const seat of seatsToSelect) {
-        // 선택될 좌석 상태 변경
-        seat.selectedBy = socket.id;
-        seat.updatedAt = currentTime;
-        seat.expirationTime = new Date(
-          Date.now() + SELECTION_TIMEOUT
-        ).toISOString();
 
-        // Redis 업데이트
-        await updateSeatInRedis(areaName, seat.id, seat);
-        await setSeatExpirationInRedis(areaName, seat.id);
+      seat.reservedUserId = userId;
+      seat.selectedBy = null;
+      seat.updatedAt = currentTime;
+      seat.expirationTime = null;
 
-        result.push({
-          seatId: seat.id,
-          selectedBy: socket.id,
-          updatedAt: currentTime,
-          expirationTime: seat.expirationTime,
-        });
+      await updateSeatInRedis(areaName, seatId, seat);
+      fastify.log.info(
+        `Seat ${seatId} will be reserved by ${client.id} in area ${areaName}`
+      );
 
-        fastify.log.info(`Seat ${seat.id} selected by ${socket.id}`);
-      }
+      await fastify.redis.del(`timer:${areaName}:${seatId}`);
 
-      // 같은 room의 유저들에게 상태 변경 브로드캐스트
-      io.to(areaName).emit("seatsSelected", result);
-    }
-  );
+      seatsToReserve.push(seat);
+      seatIdsToReserve.push(seat.id);
 
-  socket.on(
-    "reserveSeats",
-    async ({ seatIds, eventId, eventDateId, areaId, userId }) => {
-      const roomName = `${eventId}_${eventDateId}`;
-      const areaName = `${eventId}_${eventDateId}_${areaId}`;
-      const seatsToReserve = [];
-      const broadcastUpdates = [];
-      const seatIdsToReserve = [];
-
-      try {
-        if (!Array.isArray(seatIds) || seatIds.length === 0) {
-          socket.emit("error", { message: "Invalid seat IDs." });
-          return;
-        }
-
-        for (const seatId of seatIds) {
-          // Redis에서 좌석 정보 조회
-          let seat = await getSeatFromRedis(areaName, seatId);
-          if (!seat) {
-            fastify.log.warn(`Invalid seat ID: ${seatId}`);
-            socket.emit("error", { message: `Invalid seat ID: ${seatId}.` });
-            return;
-          }
-
-          // 좌석이 이미 예약되었는지 확인
-          if (seat.reservedUserId) {
-            socket.emit("error", {
-              message: `Seat ${seat.id} is reserved and cannot be selected.`,
-            });
-            return;
-          }
-
-          // 이미 다른 유저가 선택한 좌석인지 확인
-          const expired = await isSeatExpired(areaName, seat.id);
-          if (
-            seat.selectedBy !== null &&
-            seat.selectedBy !== socket.id &&
-            !expired
-          ) {
-            socket.emit("error", {
-              message: `Seat ${seat.id} is already selected by another user.`,
-            });
-            return;
-          }
-
-          const currentTime = new Date().toISOString();
-
-          // 좌석 상태 업데이트
-          seat.reservedUserId = userId;
-          seat.selectedBy = null;
-          seat.updatedAt = currentTime;
-          seat.expirationTime = null;
-
-          // Redis 업데이트
-          await updateSeatInRedis(areaName, seatId, seat);
-          fastify.log.info(
-            `Seat ${seatId} will be reserved by ${socket.id} in area ${areaName}`
-          );
-
-          await fastify.redis.del(`timer:${areaName}:${seatId}`); // seat expiration timer 삭제
-
-          seatsToReserve.push(seat);
-          seatIdsToReserve.push(seat.id);
-
-          // 브로드캐스트 업데이트에 추가
-          broadcastUpdates.push({
-            seatId: seat.id,
-            selectedBy: seat.selectedBy,
-            updatedAt: seat.updatedAt,
-            expirationTime: seat.expirationTime,
-            reservedUserId: seat.reservedUserId,
-          });
-        }
-      } catch (error) {
-        fastify.log.error(
-          `Failed to process seat ${seat.id}: ${error.message}`
-        );
-        socket.emit("error", {
-          message: `Failed to process seat ${seat.id}: ${error.message}`,
-        });
-      }
-
-      let orderId;
-      try {
-        orderId = await createOrderInRedis(
-          areaName,
-          seatIdsToReserve,
-          userId,
-          eventDateId
-        );
-        await setPaymentExpirationInRedis(areaName, orderId);
-        const order = await getOrderFromRedis(areaName, orderId);
-        const selectedArea = await getAreaFromRedis(roomName, areaId);
-
-        const area = {
-          id: selectedArea.id,
-          label: selectedArea.label,
-          price: selectedArea.price,
-        };
-        const expirationTime = new Date(
-          Date.now() + PAYMENT_TIMEOUT
-        ).toISOString();
-
-        const reservationData = {
-          id: orderId,
-          createdAt: order.createdAt,
-          expirationTime: expirationTime,
-          seats: seatsToReserve,
-          area: area,
-        };
-
-        // 클라이언트에게 주문 정보 전달
-        socket.emit("orderMade", { data: reservationData });
-      } catch (error) {
-        fastify.log.error(`Failed to prepare order data: ${error.message}`);
-        socket.emit("error", {
-          message: `Failed to prepare order data: ${error.message}`,
-        });
-      }
-
-      // 같은 room의 유저들에게 상태 변경 브로드캐스트
-      if (broadcastUpdates.length > 0) {
-        io.to(areaName).emit("seatsSelected", broadcastUpdates);
-      }
-    }
-  );
-
-  socket.on(
-    "requestOrder",
-    async ({
-      userId,
-      orderId,
-      paymentMethod,
-      eventId,
-      eventDateId,
-      areaId,
-    }) => {
-      if (
-        !userId ||
-        !orderId ||
-        !paymentMethod ||
-        !eventId ||
-        !eventDateId ||
-        !areaId
-      ) {
-        socket.emit("error", { message: "Invalid requestOrder parameters." });
-        return;
-      }
-      const areaName = `${eventId}_${eventDateId}_${areaId}`;
-
-      const redisOrderData = await getOrderFromRedis(areaName, orderId);
-      if (!redisOrderData) {
-        socket.emit("error", { message: "Invalid cache requestOrderData" });
-        return;
-      }
-
-      const client = await fastify.pg.connect();
-      try {
-        await client.query("BEGIN");
-
-        // 사용자 검증
-        const userResult = await client.query(
-          `SELECT * FROM "user" WHERE id = $1`,
-          [userId]
-        );
-        const user = userResult.rows[0];
-        if (!user) {
-          throw { code: "USER_NOT_FOUND", message: "User not found." };
-        }
-
-        // EventDate 및 Event 검증
-        const eventResult = await client.query(
-          `
-            SELECT
-              ed.id AS "eventDateId",
-              ed.date AS "eventDate",
-              e.id AS "eventId",
-              e.title AS "eventTitle",
-              e.place AS "eventPlace",
-              e.cast AS "eventCast",
-              e.thumbnail AS "eventThumbnail",
-              e."ageLimit" AS "eventAgeLimit"
-            FROM event_date ed
-            INNER JOIN event e ON ed."eventId" = e.id
-            WHERE ed.id = $1
-          `,
-          [eventDateId]
-        );
-
-        // 결과 처리
-        const event = eventResult.rows[0];
-        if (!event) {
-          throw {
-            code: "EVENT_DATE_NOT_FOUND",
-            message: "Event date not found.",
-          };
-        }
-
-        const seatIds = redisOrderData.seatIds;
-        const seatResult = await client.query(
-          `
-          SELECT
-            s.*,
-            a.id AS "areaId",
-            a.label AS "areaLabel",
-            a.price AS "areaPrice"
-          FROM seat s
-          INNER JOIN area a ON s."areaId" = a.id
-          WHERE s.id = ANY($1::uuid[])
-        `,
-          [seatIds]
-        );
-
-        // Seat 배열 생성
-        const seatsArray = seatResult.rows;
-
-        // 예약 여부 검증
-        for (const seatId of seatIds) {
-          const reservationCheck = await client.query(
-            `
-            SELECT *
-            FROM reservation r
-            LEFT JOIN "order" o ON r."orderId" = "o".id
-            WHERE "eventDateId" = $1
-            AND r."seatId" = $2
-            AND r."canceledAt" IS NULL
-            AND r."deletedAt" IS NULL
-            AND o."canceledAt" IS NULL
-          `,
-            [eventDateId, seatId]
-          );
-          if (reservationCheck.rows.length > 0) {
-            throw {
-              code: "EXISTING_ORDER",
-              message: `Seat ${seatId} is already reserved.`,
-            };
-          }
-        }
-
-        // 주문 생성
-        // order를 생성하고 반환된 orderId를 사용
-        const pgOrderResult = await client.query(
-          `
-            INSERT INTO "order" ("userId", "paymentMethod")
-            VALUES ($1, $2)
-            RETURNING id
-          `,
-          [userId, paymentMethod]
-        );
-
-        const pgSavedOrder = pgOrderResult.rows[0];
-        const pgSavedOrderId = pgSavedOrder.id;
-
-        // reservation 테이블에 다중 row 삽입
-        for (const seatId of seatIds) {
-          const reservationParam = {
-            pgSavedOrderId,
-            eventDateId,
-            seatId,
-          };
-
-          const query = `
-            INSERT INTO reservation ("orderId", "eventDateId", "seatId")
-            VALUES ($1, $2, $3)
-          `;
-
-          await client.query(query, [
-            reservationParam.pgSavedOrderId,
-            reservationParam.eventDateId,
-            reservationParam.seatId,
-          ]);
-        }
-
-        // 총 금액 계산
-        const totalAmountResult = await client.query(
-          `
-          SELECT SUM(area.price) AS "totalAmount"
-          FROM reservation
-          INNER JOIN seat ON reservation."seatId" = seat.id
-          INNER JOIN area AS area ON seat."areaId" = area.id
-          WHERE reservation."eventDateId" = $1
-            AND reservation."orderId" = $2
-        `,
-          [eventDateId, pgSavedOrderId]
-        );
-
-        const totalAmount = Number(totalAmountResult.rows[0]?.totalAmount || 0);
-
-        if (isNaN(totalAmount)) {
-          throw { code: "INVALID_AMOUNT", message: "Invalid total amount." };
-        }
-
-        // 포인트 차감
-        if (user.point < totalAmount) {
-          throw {
-            code: "INSUFFICIENT_BALANCE",
-            message: "Insufficient balance.",
-          };
-        }
-        await client.query(
-          `UPDATE "user" SET point = point - $1 WHERE id = $2`,
-          [totalAmount, userId]
-        );
-
-        // 응답 데이터 구성
-        const responseData = {
-          orderId: pgSavedOrder.id,
-          orderCreatedAt: pgSavedOrder.createdAt,
-          orderUpdatedAt: pgSavedOrder.updatedAt,
-          orderCanceledAt: pgSavedOrder.canceledAt,
-          paymentMethod: pgSavedOrder.paymentMethod,
-          useId: user.id,
-          userNickname: user.nickname,
-          userEmail: user.email,
-          userProfileImage: user.profileImage,
-          userRole: user.role,
-          eventId: event.eventId,
-          eventTitle: event.eventTitle,
-          eventPlace: event.eventPlace,
-          eventCast: event.eventCast,
-          eventDate: event.eventDate,
-          eventThumbnail: event.eventThumbnail,
-          eventAgeLimit: event.eventAgeLimit,
-          reservations: seatsArray.map((seat) => ({
-            seatId: seat.id,
-            seatRow: seat.row,
-            seatNumber: seat.number,
-            seatAreaId: seat.areaId,
-            seatAreaLabel: seat.areaLabel,
-            seatPrice: seat.areaPrice,
-          })),
-        };
-
-        await client.query("COMMIT"); // 트랜잭션 커밋
-
-        await updateOrderInRedis(areaName, orderId);
-
-        socket.emit("orderApproved", { success: true, data: responseData });
-      } catch (error) {
-        await client.query("ROLLBACK"); // 트랜잭션 롤백
-        console.error("Error processing order request:", error);
-
-        // 에러 응답 전송
-        socket.emit("error", {
-          error: error.code || "UNKNOWN_ERROR",
-          message: error.message || "An unexpected error occurred.",
-        });
-      } finally {
-        client.release(); // PostgreSQL 클라이언트 연결 해제
-      }
-    }
-  );
-
-  socket.on("exitArea", async ({ eventId, eventDateId, areaId }) => {
-    if (!eventId || !eventDateId || !areaId) {
-      socket.emit("error", { message: "Invalid area parameters." });
-      return;
-    }
-
-    const areaName = `${eventId}_${eventDateId}_${areaId}`;
-
-    try {
-      socket.leave(areaName);
-      // 클라이언트에게 데이터 전송
-      socket.emit("areaExited", {
-        message: `You have left the area: ${areaName}`,
-      });
-
-      const allSeats = await getAllSeatsFromRedis(areaName);
-      await releaseSeats(socket.id, allSeats, areaName);
-
-      fastify.log.info(`Client ${socket.id} left area: ${areaName}.`);
-    } catch (error) {
-      fastify.log.error(`Error exiting area ${areaName}:`, error);
-      socket.emit("error", {
-        message: "Failed to leave current area.",
+      broadcastUpdates.push({
+        seatId: seat.id,
+        selectedBy: seat.selectedBy,
+        updatedAt: seat.updatedAt,
+        expirationTime: seat.expirationTime,
+        reservedUserId: seat.reservedUserId,
       });
     }
-  });
-
-  socket.on("exitRoom", async ({ eventId, eventDateId }) => {
-    if (!eventId || !eventDateId) {
-      socket.emit("error", { message: "Invalid room parameters." });
-      return;
-    }
-
-    const roomName = `${eventId}_${eventDateId}`;
-
-    try {
-      socket.leave(roomName);
-      // 클라이언트에게 데이터 전송
-      socket.emit("roomExited", {
-        message: `You have left the room: ${roomName}`,
-      });
-
-      fastify.log.info(`Client ${socket.id} left room: ${roomName}.`);
-    } catch (error) {
-      fastify.log.error(`Error exiting area ${areaName}:`, error);
-      socket.emit("error", {
-        message: "Failed to leave current area.",
-      });
-    }
-  });
-
-  // 클라이언트 연결 해제 처리
-  socket.on("disconnect", async () => {
-    fastify.log.info(`Client disconnected: ${socket.id}`);
-  });
-});
-
-// 클라이언트가 Room을 떠날 때 처리
-io.of("/").adapter.on("leave-room", async (room, id) => {
-  if (room != id) {
-    await decrementRoomCount(room);
-    io.serverSideEmit("leave-room", { room, id });
-    const socket = io.sockets.sockets.get(id);
-    if (socket) {
-      await handleClientLeave(socket, room);
-    }
+  } catch (error) {
+    fastify.log.error(`Failed to process seats: ${error.message}`);
+    sendMessage(client, "error", {
+      message: `Failed to process seats: ${error.message}`,
+    });
+    return;
   }
+
+  let orderId;
+  try {
+    orderId = await createOrderInRedis(
+      areaName,
+      seatIdsToReserve,
+      userId,
+      eventDateId
+    );
+    await setPaymentExpirationInRedis(areaName, orderId);
+    const order = await getOrderFromRedis(areaName, orderId);
+    const selectedArea = await getAreaFromRedis(roomName, areaId);
+
+    const area = {
+      id: selectedArea.id,
+      label: selectedArea.label,
+      price: selectedArea.price,
+    };
+    const expirationTime = new Date(Date.now() + PAYMENT_TIMEOUT).toISOString();
+
+    const reservationData = {
+      id: orderId,
+      createdAt: order.createdAt,
+      expirationTime: expirationTime,
+      seats: seatsToReserve,
+      area: area,
+    };
+
+    sendMessage(client, "orderMade", { data: reservationData });
+  } catch (error) {
+    fastify.log.error(`Failed to prepare order data: ${error.message}`);
+    sendMessage(client, "error", {
+      message: `Failed to prepare order data: ${error.message}`,
+    });
+  }
+
+  if (broadcastUpdates.length > 0) {
+    await publishReservationMessage({
+      room: areaName,
+      type: "seatsSelected",
+      payload: broadcastUpdates,
+    });
+  }
+}
+
+async function handleRequestOrder(
+  wsClient,
+  { userId, orderId, paymentMethod, eventId, eventDateId, areaId } = {}
+) {
+  if (!userId || !orderId || !paymentMethod || !eventId || !eventDateId || !areaId) {
+    sendMessage(wsClient, "error", { message: "Invalid requestOrder parameters." });
+    return;
+  }
+  const areaName = `${eventId}_${eventDateId}_${areaId}`;
+
+  const redisOrderData = await getOrderFromRedis(areaName, orderId);
+  if (!redisOrderData) {
+    sendMessage(wsClient, "error", { message: "Invalid cache requestOrderData" });
+    return;
+  }
+
+  const pgClient = await fastify.pg.connect();
+  try {
+    await pgClient.query("BEGIN");
+
+    const userResult = await pgClient.query(`SELECT * FROM "user" WHERE id = $1`, [
+      userId,
+    ]);
+    const user = userResult.rows[0];
+    if (!user) {
+      throw { code: "USER_NOT_FOUND", message: "User not found." };
+    }
+
+    const eventResult = await pgClient.query(
+      `
+        SELECT
+          ed.id AS "eventDateId",
+          ed.date AS "eventDate",
+          e.id AS "eventId",
+          e.title AS "eventTitle",
+          e.place AS "eventPlace",
+          e.cast AS "eventCast",
+          e.thumbnail AS "eventThumbnail",
+          e."ageLimit" AS "eventAgeLimit"
+        FROM event_date ed
+        INNER JOIN event e ON ed."eventId" = e.id
+        WHERE ed.id = $1
+      `,
+      [eventDateId]
+    );
+
+    const event = eventResult.rows[0];
+    if (!event) {
+      throw {
+        code: "EVENT_DATE_NOT_FOUND",
+        message: "Event date not found.",
+      };
+    }
+
+    const seatIds = redisOrderData.seatIds;
+    const seatResult = await pgClient.query(
+      `
+        SELECT
+          s.*,
+          a.id AS "areaId",
+          a.label AS "areaLabel",
+          a.price AS "areaPrice"
+        FROM seat s
+        INNER JOIN area a ON s."areaId" = a.id
+        WHERE s.id = ANY($1::uuid[])
+      `,
+      [seatIds]
+    );
+
+    const seatsArray = seatResult.rows;
+
+    for (const seatId of seatIds) {
+      const reservationCheck = await pgClient.query(
+        `
+          SELECT *
+          FROM reservation r
+          LEFT JOIN "order" o ON r."orderId" = "o".id
+          WHERE "eventDateId" = $1
+          AND r."seatId" = $2
+          AND r."canceledAt" IS NULL
+          AND r."deletedAt" IS NULL
+          AND o."canceledAt" IS NULL
+        `,
+        [eventDateId, seatId]
+      );
+      if (reservationCheck.rows.length > 0) {
+        throw {
+          code: "EXISTING_ORDER",
+          message: `Seat ${seatId} is already reserved.`,
+        };
+      }
+    }
+
+    const pgOrderResult = await pgClient.query(
+      `
+        INSERT INTO "order" ("userId", "paymentMethod")
+        VALUES ($1, $2)
+        RETURNING id
+      `,
+      [userId, paymentMethod]
+    );
+
+    const pgSavedOrder = pgOrderResult.rows[0];
+    const pgSavedOrderId = pgSavedOrder.id;
+
+    for (const seatId of seatIds) {
+      await pgClient.query(
+        `
+          INSERT INTO reservation ("orderId", "eventDateId", "seatId")
+          VALUES ($1, $2, $3)
+        `,
+        [pgSavedOrderId, eventDateId, seatId]
+      );
+    }
+
+    const totalAmountResult = await pgClient.query(
+      `
+        SELECT SUM(area.price) AS "totalAmount"
+        FROM reservation
+        INNER JOIN seat ON reservation."seatId" = seat.id
+        INNER JOIN area AS area ON seat."areaId" = area.id
+        WHERE reservation."eventDateId" = $1
+          AND reservation."orderId" = $2
+      `,
+      [eventDateId, pgSavedOrderId]
+    );
+
+    const totalAmount = Number(totalAmountResult.rows[0]?.totalAmount || 0);
+
+    if (isNaN(totalAmount)) {
+      throw { code: "INVALID_AMOUNT", message: "Invalid total amount." };
+    }
+
+    if (user.point < totalAmount) {
+      throw {
+        code: "INSUFFICIENT_BALANCE",
+        message: "Insufficient balance.",
+      };
+    }
+
+    await pgClient.query(`UPDATE "user" SET point = point - $1 WHERE id = $2`, [
+      totalAmount,
+      userId,
+    ]);
+
+    const responseData = {
+      orderId: pgSavedOrder.id,
+      orderCreatedAt: pgSavedOrder.createdAt,
+      orderUpdatedAt: pgSavedOrder.updatedAt,
+      orderCanceledAt: pgSavedOrder.canceledAt,
+      paymentMethod: pgSavedOrder.paymentMethod,
+      useId: user.id,
+      userNickname: user.nickname,
+      userEmail: user.email,
+      userProfileImage: user.profileImage,
+      userRole: user.role,
+      eventId: event.eventId,
+      eventTitle: event.eventTitle,
+      eventPlace: event.eventPlace,
+      eventCast: event.eventCast,
+      eventDate: event.eventDate,
+      eventThumbnail: event.eventThumbnail,
+      eventAgeLimit: event.eventAgeLimit,
+      reservations: seatsArray.map((seat) => ({
+        seatId: seat.id,
+        seatRow: seat.row,
+        seatNumber: seat.number,
+        seatAreaId: seat.areaId,
+        seatAreaLabel: seat.areaLabel,
+        seatPrice: seat.areaPrice,
+      })),
+    };
+
+    await pgClient.query("COMMIT");
+
+    await updateOrderInRedis(areaName, orderId);
+
+    sendMessage(wsClient, "orderApproved", { success: true, data: responseData });
+  } catch (error) {
+    await pgClient.query("ROLLBACK");
+    console.error("Error processing order request:", error);
+
+    sendMessage(wsClient, "error", {
+      error: error.code || "UNKNOWN_ERROR",
+      message: error.message || "An unexpected error occurred.",
+    });
+  } finally {
+    pgClient.release();
+  }
+}
+
+async function handleExitArea(client, { eventId, eventDateId, areaId } = {}) {
+  if (!eventId || !eventDateId || !areaId) {
+    sendMessage(client, "error", { message: "Invalid area parameters." });
+    return;
+  }
+
+  const areaName = `${eventId}_${eventDateId}_${areaId}`;
+
+  try {
+    await leaveAreaRoom(client, areaName);
+    sendMessage(client, "areaExited", {
+      message: `You have left the area: ${areaName}`,
+    });
+  } catch (error) {
+    fastify.log.error(`Error exiting area ${areaName}:`, error);
+    sendMessage(client, "error", {
+      message: "Failed to leave current area.",
+    });
+  }
+}
+
+async function handleExitRoom(client, { eventId, eventDateId } = {}) {
+  if (!eventId || !eventDateId) {
+    sendMessage(client, "error", { message: "Invalid room parameters." });
+    return;
+  }
+
+  const roomName = `${eventId}_${eventDateId}`;
+
+  try {
+    await leaveMainRoom(client, roomName);
+    sendMessage(client, "roomExited", {
+      message: `You have left the room: ${roomName}`,
+    });
+  } catch (error) {
+    fastify.log.error(`Error exiting room ${roomName}:`, error);
+    sendMessage(client, "error", {
+      message: "Failed to leave current room.",
+    });
+  }
+}
+
+async function handleClientDisconnect(client) {
+  if (client.disconnectHandled) return;
+  client.disconnectHandled = true;
+
+  fastify.log.info(`Client disconnected: ${client.id}`);
+
+  const rooms = [...client.rooms].filter((roomName) => roomName !== client.id);
+  for (const areaName of rooms.filter(isAreaRoom)) {
+    await leaveAreaRoom(client, areaName);
+  }
+  for (const roomName of rooms.filter(isMainRoom)) {
+    await leaveMainRoom(client, roomName);
+  }
+
+  removeClientFromAllRooms(client);
+  wsClients.delete(client.id);
+}
+
+async function handleClientMessage(client, rawMessage) {
+  let message;
+  try {
+    message = JSON.parse(rawMessage.toString());
+  } catch {
+    sendMessage(client, "error", { message: "Invalid message format." });
+    return;
+  }
+
+  if (!isRecord(message) || typeof message.type !== "string") {
+    sendMessage(client, "error", { message: "Invalid message format." });
+    return;
+  }
+
+  try {
+    switch (message.type) {
+      case "joinRoom":
+        await handleJoinRoom(client, message.payload);
+        break;
+      case "joinArea":
+        await handleJoinArea(client, message.payload);
+        break;
+      case "selectSeats":
+        await handleSelectSeats(client, message.payload);
+        break;
+      case "reserveSeats":
+        await handleReserveSeats(client, message.payload);
+        break;
+      case "requestOrder":
+        await handleRequestOrder(client, message.payload);
+        break;
+      case "exitArea":
+        await handleExitArea(client, message.payload);
+        break;
+      case "exitRoom":
+        await handleExitRoom(client, message.payload);
+        break;
+      default:
+        sendMessage(client, "error", { message: "Unknown message type." });
+    }
+  } catch (error) {
+    fastify.log.error(`Error handling ${message.type}: ${error.message}`);
+    sendMessage(client, "error", { message: "Internal server error." });
+  }
+}
+
+async function handleWebSocketConnection(ws, request) {
+  const requestUrl = new URL(
+    request.url || "/",
+    `http://${request.headers.host || "localhost"}`
+  );
+  const token = requestUrl.searchParams.get("token");
+
+  if (!token) {
+    sendRaw(ws, "connect_error", { message: "Authentication error" });
+    ws.close(CLOSE_POLICY_VIOLATION, "Authentication error");
+    return;
+  }
+
+  if (!(await validateToken(token))) {
+    sendRaw(ws, "connect_error", { message: "Authentication error 2" });
+    ws.close(CLOSE_POLICY_VIOLATION, "Authentication error 2");
+    return;
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, fastify.config.JWT_SECRET_FOR_ENTRANCE);
+  } catch {
+    sendRaw(ws, "connect_error", { message: "Authentication error" });
+    ws.close(CLOSE_POLICY_VIOLATION, "Authentication error");
+    return;
+  }
+
+  const client = {
+    id: crypto.randomUUID(),
+    ws,
+    data: { user: decoded },
+    rooms: new Set(),
+    disconnectHandled: false,
+  };
+
+  wsClients.set(client.id, client);
+  addClientToRoom(client, client.id);
+  sendMessage(client, "connected", { id: client.id });
+
+  fastify.log.info(`New WebSocket client connected: ${client.id}`);
+
+  ws.on("message", (rawMessage) => {
+    void handleClientMessage(client, rawMessage);
+  });
+
+  ws.on("close", () => {
+    void handleClientDisconnect(client);
+  });
+
+  ws.on("error", (error) => {
+    fastify.log.error(`WebSocket error for ${client.id}: ${error.message}`);
+  });
+}
+
+wsServer.on("connection", (ws, request) => {
+  void handleWebSocketConnection(ws, request);
 });
 
 async function releaseSeats(socketId, seats, areaName) {
@@ -1249,7 +1349,11 @@ async function releaseSeats(socketId, seats, areaName) {
     }
   }
   if (seatsToRelease.length > 0) {
-    io.to(areaName).emit("seatsSelected", seatsToRelease);
+    await publishReservationMessage({
+      room: areaName,
+      type: "seatsSelected",
+      payload: seatsToRelease,
+    });
   }
 }
 
@@ -1272,96 +1376,6 @@ async function releaseSeats(socketId, seats, areaName) {
 //     fastify.log.info(`Message sent to queue "${queueName}": ${message}`);
 //   } catch (error) {
 //     fastify.log.error(`Failed to send message to queue "${queueName}":`, error);
-//   }
-// }
-
-// 공통 로직: 클라이언트가 Room을 떠날 때 처리
-async function handleClientLeave(socket, roomName) {
-  try {
-    // Room의 현재 접속자 수 확인
-    // const currentConnections =
-    //   io.sockets.adapter.rooms.get(roomName)?.size || 0;
-    // fastify.log.info(
-    //   `Client ${socket.id} left room: ${roomName}. Current connections: ${currentConnections}/${MAX_ROOM_CONNECTIONS}`
-    // );
-    // 접속자가 최대치 아래로 떨어지면 RabbitMQ에 신호 전송
-    // if (currentConnections < MAX_ROOM_CONNECTIONS) {
-    //   await sendMessageToQueue(roomName, "allow");
-    // }
-    // 마지막 사용자인 경우 reservation interval 타이머 제거
-    // if (roomIntervals[roomName]) {
-    //   clearReservationStatusInterval(roomName);
-    // }
-  } catch (error) {
-    fastify.log.error(
-      `Error handling client leave for room ${roomName}:`,
-      error
-    );
-  }
-}
-
-// function startReservationStatusInterval(eventId, eventDateId) {
-//   const roomName = `${eventId}_${eventDateId}`;
-//   // 만약 해당 room에 대한 타이머가 없다면 생성
-//   if (!roomIntervals[roomName]) {
-//     roomIntervals[roomName] = setInterval(async () => {
-//       try {
-//         // areas 및 areaStats 계산 로직
-//         let areas = await getAllAreasFromRedis(roomName);
-//         if (areas.length === 0) {
-//           areas = await getAreasForRoom(eventId);
-//           for (const area of areas) {
-//             await updateAreaInRedis(roomName, area.id, area);
-//           }
-//         }
-
-//         const areaStats = [];
-//         for (const area of areas) {
-//           const areaId = area.id;
-//           const areaName = `${eventId}_${eventDateId}_${areaId}`;
-//           let seats = await getAllSeatsFromRedis(areaName);
-//           if (seats.length === 0) {
-//             seats = await getSeatsForArea(eventDateId, areaId);
-//             for (const seat of seats) {
-//               await updateSeatInRedis(areaName, seat.id, seat);
-//             }
-//           }
-
-//           const totalSeatsNum = seats.length;
-//           const reservedSeatsNum = seats.filter(
-//             (seat) => seat.reservedUserId !== null
-//           ).length;
-//           areaStats.push({
-//             areaId: areaId,
-//             totalSeatsNum: totalSeatsNum,
-//             reservedSeatsNum: reservedSeatsNum,
-//           });
-//         }
-
-//         // 해당 room에 통계 정보 전송
-//         io.to(roomName).emit("reservedSeatsStatistic", areaStats);
-//       } catch (error) {
-//         fastify.log.error(
-//           `Error emitting reservedSeatsStatistic: ${error.message}`
-//         );
-//       }
-//     }, RESERVATION_STATUS_INTERVAL); // 2초마다 실행
-//   }
-// }
-
-// async function clearReservationStatusInterval(roomName) {
-//   try {
-//     const currentConnections = await getRoomUserCount(roomName);
-//     fastify.log.info(
-//       `roomName: ${roomName}, currentConnections: ${currentConnections}`
-//     );
-//     if (currentConnections < 1 && roomIntervals[roomName]) {
-//       clearInterval(roomIntervals[roomName]);
-//       delete roomIntervals[roomName];
-//       fastify.log.info(`Interval for room ${roomName} has been cleared.`);
-//     }
-//   } catch {
-//     fastify.log.info(`Failed to clear Interval for room ${roomName}`);
 //   }
 // }
 
@@ -1517,10 +1531,17 @@ async function gracefulShutdown(signal) {
   fastify.log.info(`Received signal: ${signal}. Starting graceful shutdown...`);
 
   try {
-    io.sockets.sockets.forEach((socket) => {
-      socket.disconnect(true);
-    });
-    fastify.log.info("All Socket.IO connections have been closed.");
+    clearInterval(serverTimeInterval);
+
+    for (const client of wsClients.values()) {
+      closeClient(client, 1000, "Server shutting down");
+    }
+    wsServer.close();
+    fastify.log.info("All WebSocket connections have been closed.");
+
+    await redisSubscriber.disconnect();
+    await reservationPubClient.disconnect();
+    await reservationSubClient.disconnect();
 
     await fastify.close();
     fastify.log.info("Fastify server has been closed.");
