@@ -27,6 +27,7 @@ const schema = {
     "CACHE_PORT",
     "DB_URL",
     // "MQ_URL",
+    "SCHEDULING_SERVER_URL",
   ],
   properties: {
     PORT: {
@@ -50,8 +51,14 @@ const schema = {
     // MQ_URL: {
     //   type: "string",
     // },
+    SCHEDULING_SERVER_URL: {
+      type: "string",
+    },
   },
 };
+
+const createServiceUrl = (baseUrl, path) =>
+  new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -643,7 +650,10 @@ io.on("connection", (socket) => {
       );
 
       await fetch(
-        "https://socketing.hjyoon.me/scheduling/seat/reservation/statistic",
+        createServiceUrl(
+          fastify.config.SCHEDULING_SERVER_URL,
+          "scheduling/seat/reservation/statistic"
+        ),
         {
           method: "POST",
           headers: {
