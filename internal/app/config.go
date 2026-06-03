@@ -1,6 +1,7 @@
 package app
 
 import (
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -22,10 +23,25 @@ func LoadConfig() Config {
 		JWTSecret:         env("JWT_SECRET", "my-jwt-secret"),
 		EntranceJWTSecret: env("JWT_SECRET_FOR_ENTRANCE", "my-jwt-secret"),
 		RedisAddr:         redisAddr(),
-		DBURL:             env("DB_URL", "postgres://postgres:password@localhost:5432/socketing?sslmode=disable"),
+		DBURL:             dbURL(),
 		SchedulingURL:     env("SCHEDULING_SERVER_URL", "http://localhost:3001/"),
 		CORSOrigins:       splitList(env("CORS_ALLOWED_ORIGINS", "*")),
 	}
+}
+
+func dbURL() string {
+	raw := env("DB_URL", "postgres://postgres:password@localhost:5432/socketing")
+	if strings.Contains(raw, "sslmode=") {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		return raw
+	}
+	query := parsed.Query()
+	query.Set("sslmode", "disable")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func env(key, fallback string) string {

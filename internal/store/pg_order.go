@@ -28,10 +28,15 @@ func (p *Postgres) CreateOrder(ctx context.Context, req ws.OrderRequest) (map[st
 	if _, err = tx.ExecContext(ctx, `UPDATE "user" SET point=point-$1 WHERE id=$2`, total, req.UserID); err != nil {
 		return nil, err
 	}
+	data, err := orderResponse(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	return map[string]any{"orderId": id, "useId": user.ID, "reservations": req.SeatIDs}, nil
+	data["useId"] = user.ID
+	return data, nil
 }
 
 type dbUser struct {
