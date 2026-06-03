@@ -11,6 +11,9 @@ func FindAdjacent(seats []Seat, selected Seat, count int) []Seat {
 	}
 	result := []Seat{selected}
 	add := func(row, num int) bool {
+		if len(result) >= count {
+			return false
+		}
 		for _, s := range available {
 			if s.Row == row && s.Number == num && !contains(result, s.ID) {
 				result = append(result, s)
